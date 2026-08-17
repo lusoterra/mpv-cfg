@@ -16,7 +16,7 @@ local opts = {
     -- showcqtbar
     -- showwaves
 
-    quality = "medium",
+    quality = "high",
     -- verylow
     -- low
     -- medium
