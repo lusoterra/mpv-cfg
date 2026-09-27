@@ -35,6 +35,12 @@ local opts = {
 -- cycle visualizer
 local cycle_key = "c"
 
+-- set when the user presses `c`: in noalbumart mode the default is to show
+-- the album art, but an explicit cycle press means "I want the visualizer".
+-- reset whenever a new file starts.
+local user_override = false
+local last_path = nil
+
 if not (mp.get_property("options/lavfi-complex", "") == "") then
     return
 end
@@ -289,7 +295,7 @@ local function select_visualizer(vtrack, atrack)
     elseif opts.mode == "force" then
         return get_visualizer(opts.name, opts.quality, vtrack)
     elseif opts.mode == "noalbumart" then
-        if vtrack == nil then
+        if vtrack == nil or user_override then
             return get_visualizer(opts.name, opts.quality, vtrack)
         end
         return ""
@@ -305,6 +311,12 @@ local function select_visualizer(vtrack, atrack)
 end
 
 local function visualizer_hook()
+    local path = mp.get_property("path", "")
+    if path ~= last_path then
+        last_path = path
+        user_override = false
+    end
+
     local count = mp.get_property_number("track-list/count", -1)
     if count <= 0 then
         return
@@ -347,6 +359,7 @@ local function cycle_visualizer()
         end
     end
     opts.name = visualizer_name_list[index]
+    user_override = true
     visualizer_hook()
 end
 
