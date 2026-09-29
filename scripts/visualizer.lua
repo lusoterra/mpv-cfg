@@ -24,7 +24,13 @@ local opts = {
     -- veryhigh
 
     height = 9,
-    -- [4 .. 12]
+    -- [4 .. 12] sixteenths of the width (16:9 when 9); ignored when
+    -- aspect is set
+
+    aspect = "",
+    -- ""               use the height option above (default 16:9)
+    -- "21:9"           ultrawide: render at 21:9 so it fills the screen
+    -- "16:10", "4:3"   other panels; any "<w>:<h>" works
 
     forcewindow = true,
     -- true (yes)       always run visualizer regardless of force-window settings
@@ -147,6 +153,13 @@ options.read_options(opts)
 opts.height = math.min(12, math.max(4, opts.height))
 opts.height = math.floor(opts.height)
 
+-- "21:9" style aspect override; falls back to the height option
+local aspect_wa, aspect_ha = tostring(opts.aspect):match("^(%d+)%s*:%s*(%d+)$")
+aspect_wa, aspect_ha = tonumber(aspect_wa), tonumber(aspect_ha)
+if not (aspect_wa and aspect_ha and aspect_wa > 0 and aspect_ha > 0) then
+    aspect_wa, aspect_ha = nil, nil
+end
+
 if not opts.forcewindow and mp.get_property('force-window') == "no" then
     return
 end
@@ -175,6 +188,11 @@ local function get_visualizer(name, quality, vtrack)
     end
 
     h = w * opts.height / 16
+    if aspect_wa then
+        h = w * aspect_ha / aspect_wa
+    end
+    h = math.floor(h)
+    if h % 2 == 1 then h = h - 1 end
 
     if name == "showcqt" then
         local count = math.ceil(w * 180 / 1920 / fps)
@@ -260,11 +278,47 @@ local function get_visualizer(name, quality, vtrack)
 
 
     elseif name == "showwaves" then
+        -- showwaves only draws (48000/fps*4) px wide (black right side
+        -- when w is larger). n>=1 would widen the window but starve the
+        -- frame rate instead (n=2 drops 144fps to ~12fps), so: keep full
+        -- rate, crop the drawn region and stretch it to full width (also
+        -- thickens lines ~1.45x for free). scale= sets SAR to preserve
+        -- DAR, so setsar=1 is required or mpv letterboxes it back to
+        -- ~4:3. aformat pins rate+stereo so the drawn width is exact.
+        -- sqrt fattens quiet passages; acompressor auto-levels the viz
+        -- branch only (fast attack so it works from the first frame;
+        -- heard audio is untouched) so the wave always spans full
+        -- height; the dimmed blurred copy screened
+        -- underneath gives the teal/blue glow (dimmed so dense passages
+        -- can't white-out, half-res so no downscale moire).
+        local draww = math.floor(48000 / fps * 4)
+        local stretch = ""
+        if draww < w then
+            stretch = ",crop               =" .. draww .. ":" .. h .. ":0:0," ..
+                      "scale              =" .. w .. "x" .. h .. ":flags = bilinear," ..
+                      "setsar             = 1"
+        end
+        local qw = math.max(2, math.floor(w / 2))
+        local qh = math.max(2, math.floor(h / 2))
         return "[aid1] asplit [ao]," ..
+            "aformat            = sample_rates = 48000:" ..
+                "channel_layouts = stereo," ..
+            "acompressor        = threshold = 0.03:ratio = 8:" ..
+                "attack = 5:release = 200:makeup = 16," ..
             "showwaves          =" ..
                 "size           =" .. w .. "x" .. h .. ":" ..
                 "r              =" .. fps .. ":" ..
-                "mode           = p2p," ..
+                "mode           = p2p:" ..
+                "scale          = sqrt:" ..
+                "colors         = teal|dodgerblue" ..
+            stretch .. "," ..
+            "format             = gbrp," ..
+            "split              = 2 [sw_sharp][sw_soft];" ..
+            "[sw_soft] scale    =" .. qw .. "x" .. qh .. "," ..
+            "gblur              = sigma = 2," ..
+            "scale              =" .. w .. "x" .. h .. "," ..
+            "eq                 = brightness = -0.35 [sw_glow];" ..
+            "[sw_sharp][sw_glow] blend = all_mode = screen," ..
             "format             = rgb0 [vo]"
     elseif name == "off" then
         local hasvideo = false
@@ -290,7 +344,13 @@ local function get_visualizer(name, quality, vtrack)
 end
 
 local function select_visualizer(vtrack, atrack)
-    if atrack == nil or opts.mode == "off" then
+    if atrack == nil then
+        return ""
+    elseif opts.mode == "off" then
+        -- off by default, but an explicit `c` press switches it on
+        if user_override then
+            return get_visualizer(opts.name, opts.quality, vtrack)
+        end
         return ""
     elseif opts.mode == "force" then
         return get_visualizer(opts.name, opts.quality, vtrack)
@@ -361,6 +421,7 @@ local function cycle_visualizer()
     opts.name = visualizer_name_list[index]
     user_override = true
     visualizer_hook()
+    mp.osd_message("visualizer: " .. opts.name, 1.5)
 end
 
 mp.add_key_binding(cycle_key, "cycle-visualizer", cycle_visualizer)
