@@ -10,6 +10,8 @@
 --
 --   p  : reset speed AND pitch
 --
+-- Hold any stepper to auto-repeat (tunable in script-opts/nightcore.conf:
+-- hold_delay=0.5, hold_rate=5).
 -- Both steppers share the same lattice logic: above 1x they snap to
 -- 1 + n*d (so 1.03 + ] -> 1.05), below 1x they snap to the reciprocal
 -- lattice 1/(1 + m*d) (so pitch semitones mirror speed: -0.85 st, -1.65 st, ...).
@@ -153,15 +155,64 @@ local function pitch_step(d, dir)
     show_all()
 end
 
-mp.add_key_binding("]", "speed-up-5", function() speed_step(0.05, 1) end)
-mp.add_key_binding("[", "speed-down-5", function() speed_step(0.05, -1) end)
-mp.add_key_binding("}", "speed-up-1", function() speed_step(0.01, 1) end)
-mp.add_key_binding("{", "speed-down-1", function() speed_step(0.01, -1) end)
+local options = require("mp.options")
+local opts = {
+    -- seconds to hold before auto-repeat kicks in
+    hold_delay = 0.5,
+    -- repeats per second once held
+    hold_rate = 5,
+}
+options.read_options(opts, "nightcore")
 
-mp.add_key_binding("Ctrl+]", "pitch-up-5", function() pitch_step(0.05, 1) end)
-mp.add_key_binding("Ctrl+[", "pitch-down-5", function() pitch_step(0.05, -1) end)
-mp.add_key_binding("Ctrl+}", "pitch-up-1", function() pitch_step(0.01, 1) end)
-mp.add_key_binding("Ctrl+{", "pitch-down-1", function() pitch_step(0.01, -1) end)
+local HOLD_DELAY = tonumber(opts.hold_delay) or 0.5
+local hold_rate = tonumber(opts.hold_rate) or 5
+if HOLD_DELAY < 0 then HOLD_DELAY = 0 end
+if not (hold_rate > 0) then hold_rate = 5 end
+local HOLD_INTERVAL = 1 / hold_rate -- repeat interval once held
+
+-- Press-and-hold wrapper: single step on press, then auto-repeat while held.
+-- Uses complex binding (down/up events) with our own timers so the 1s delay
+-- applies only to these keys and doesn't affect global input-ar-delay.
+local function bind_hold(key, name, step_fn)
+    local delay_timer = nil
+    local repeat_timer = nil
+    local function stop()
+        if delay_timer then
+            delay_timer:kill()
+            delay_timer = nil
+        end
+        if repeat_timer then
+            repeat_timer:kill()
+            repeat_timer = nil
+        end
+    end
+    mp.add_key_binding(key, name, function(event)
+        if event.event == "down" then
+            step_fn()
+            stop()
+            delay_timer = mp.add_timeout(HOLD_DELAY, function()
+                delay_timer = nil
+                repeat_timer = mp.add_periodic_timer(HOLD_INTERVAL, step_fn)
+            end)
+        elseif event.event == "press" then
+            -- fallback: invoked via script-message, menu, etc. (no down/up)
+            step_fn()
+        elseif event.event == "up" or event.event == "cancel" then
+            stop()
+        end
+        -- NOTE: deliberately ignoring "repeat" events; our own timer handles it
+    end, { complex = true, repeatable = true })
+end
+
+bind_hold("]", "speed-up-5", function() speed_step(0.05, 1) end)
+bind_hold("[", "speed-down-5", function() speed_step(0.05, -1) end)
+bind_hold("}", "speed-up-1", function() speed_step(0.01, 1) end)
+bind_hold("{", "speed-down-1", function() speed_step(0.01, -1) end)
+
+bind_hold("Ctrl+]", "pitch-up-5", function() pitch_step(0.05, 1) end)
+bind_hold("Ctrl+[", "pitch-down-5", function() pitch_step(0.05, -1) end)
+bind_hold("Ctrl+}", "pitch-up-1", function() pitch_step(0.01, 1) end)
+bind_hold("Ctrl+{", "pitch-down-1", function() pitch_step(0.01, -1) end)
 
 mp.add_key_binding("p", "nightcore-reset", function()
     mp.set_property_number("speed", 1)
