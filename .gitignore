@@ -2,3 +2,5 @@ memo-history.log
 celebi.txt
 # two-pass encoder stats (see pass_log_dir in script-opts/webm.conf)
 logs/
+# copyparty upload password — never commit
+copyparty.env
