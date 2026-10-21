@@ -287,7 +287,7 @@ local function finish_upload(success, url_or_err)
         local copied = copy_link(url_or_err)
         open_link(url_or_err)
         local note = copied and "(link copied to clipboard)" or "(copy it manually!)"
-        mp.osd_message("Copyparty upload complete:\n" .. url_or_err .. "\n" .. note, 30)
+        mp.osd_message("Copyparty upload complete:\n" .. url_or_err .. "\n" .. note, 5)
         msg.info("copyparty: uploaded " .. url_or_err)
     else
         mp.osd_message("Copyparty upload failed:\n" .. tostring(url_or_err), 10)
