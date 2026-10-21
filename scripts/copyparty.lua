@@ -19,6 +19,12 @@ local options = {
     -- alone is used (header "PW: <password>"); otherwise
     -- "PW: <user>:<password>" is sent.
     copyparty_user = "",
+    -- Optional SOCKS proxy for the upload, e.g. [[socks5h://127.0.0.1:9050]].
+    -- Only port 4447 (i2p) and 9050 (tor) are accepted, and socks5:// is
+    -- upgraded to socks5h:// so hostnames never leak through local DNS.
+    -- Plain http:// uploads are refused unless a matching proxy is set:
+    -- .onion requires :9050, .i2p requires :4447 (loopback http:// is exempt).
+    copyparty_proxy = "",
     -- File holding COPYPARTY_PASSWORD=... (gitignored, never committed).
     -- A starting "~" is expanded.
     password_file = "~/.config/mpv/copyparty.env",
@@ -59,6 +65,61 @@ local function read_env_value(path, key)
     return nil
 end
 
+-- normalized "socks5h://host:port", "" for direct, or nil+err.
+-- Only the i2p (4447) and tor (9050) endpoints are accepted, and plain
+-- socks5:// is upgraded to socks5h:// so .onion/.i2p names always
+-- resolve through the proxy instead of leaking to local DNS.
+local function normalized_proxy()
+    local proxy = options.copyparty_proxy or ""
+    if proxy == "" then return "" end
+    local host, port = proxy:match("^socks5h?://([^:/%s]+):(%d+)%s*$")
+    if not host then
+        return nil, "copyparty_proxy must look like socks5h://127.0.0.1:9050"
+    end
+    port = tonumber(port)
+    if port ~= 4447 and port ~= 9050 then
+        return nil, "copyparty_proxy port must be 4447 (i2p) or 9050 (tor)"
+    end
+    return "socks5h://" .. host .. ":" .. port
+end
+
+-- returns proxy ("" = direct) or nil+reason. Plain http:// is refused
+-- outright unless it stays on loopback or goes through the matching proxy.
+local function check_transport(url)
+    local scheme, rest = url:match("^(%a+)://(.+)$")
+    if not scheme then
+        return nil, "copyparty_url must start with http(s)://"
+    end
+    local host = ((rest:match("^([^/:?#%s]+)") or ""):lower())
+    local proxy, perr = normalized_proxy()
+    if perr then return nil, perr end
+    if scheme:lower() == "https" then return proxy end
+    if host == "localhost" or host == "127.0.0.1" or host == "[::1]" then
+        return proxy -- loopback: nothing leaves the machine
+    end
+    -- actual special-use domains only, matched at the END: .onion (tor),
+    -- .i2p and .b32.i2p long-form destinations (i2p). A clearnet name
+    -- merely containing those strings (noti2p.example.com) is NOT special.
+    local kind = nil
+    if host:match("%.onion$") then
+        kind = "onion"
+    elseif host:match("%.b32%.i2p$") or host:match("%.i2p$") then
+        kind = "i2p"
+    end
+    if kind then
+        local want = kind == "onion" and 9050 or 4447
+        local net = kind == "onion" and "tor" or "i2p"
+        if proxy == "" then
+            return nil, "plain http to ." .. kind .. " needs copyparty_proxy (socks5h://127.0.0.1:" .. want .. " for " .. net .. ")"
+        end
+        if tonumber(proxy:match(":(%d+)$")) ~= want then
+            return nil, "plain http to ." .. kind .. " needs the :" .. want .. " " .. net .. " proxy"
+        end
+        return proxy
+    end
+    return nil, "refusing plain http:// — use https:// (or a .onion/.i2p/.b32.i2p address with its proxy)"
+end
+
 local function secret_or_error()
     if options.copyparty_url == "" then
         return nil, "Set copyparty_url in copyparty.conf first."
@@ -71,9 +132,12 @@ local function secret_or_error()
         return nil, "No COPYPARTY_PASSWORD in " .. tostring(options.password_file)
     end
     if options.copyparty_user ~= "" then
-        return tostring(options.copyparty_user) .. ":" .. pw
+        -- HTTP basic auth works with and without --usernames on the server;
+        -- a "PW: user:pass" header would 403 on servers that expect the
+        -- bare volume password instead
+        return "basic", tostring(options.copyparty_user) .. ":" .. pw
     end
-    return pw
+    return "header", pw
 end
 
 local function temp_config_path()
@@ -91,11 +155,17 @@ end
 -- best effort: clear a leftover from a crashed session
 delete_temp_config()
 
-local function write_temp_config(secret)
+local function write_temp_config(method, secret)
     local path = temp_config_path()
     local file = io.open(path, "w")
     if not file then return nil end
-    file:write("header = \"PW: " .. secret:gsub("[\\\"]", "\\%0") .. "\"\n")
+    local esc = secret:gsub("[\\\"]", "\\%0")
+    if method == "basic" then
+        -- curl -u equivalent, keeps credentials out of argv/logs
+        file:write("user = \"" .. esc .. "\"\n")
+    else
+        file:write("header = \"PW: " .. esc .. "\"\n")
+    end
     file:close()
     if not is_windows then
         utils.subprocess({ args = { "chmod", "600", path }, cancellable = false })
@@ -118,7 +188,8 @@ local function copy_link(url)
         return true
     end
     -- mpv has no native clipboard on most setups: fall back to tools,
-    -- same chain webm.lua uses. Never logs the URL content beyond debug.
+    -- same chain webm.lua uses. Blocking call so we know it really worked
+    -- (async spawn succeeds even when the tool itself then fails).
     local candidates
     if is_windows then
         candidates = { { "clip" } }
@@ -132,13 +203,12 @@ local function copy_link(url)
         }
     end
     for _, args in ipairs(candidates) do
-        local handle = mp.command_native_async({
-            name = "subprocess",
+        local res = utils.subprocess({
             args = args,
             stdin_data = url,
-            playback_only = false,
-        }, function() end)
-        if handle then
+            cancellable = false,
+        })
+        if res and res.status == 0 then
             msg.info("copyparty: link copied via " .. tostring(args[1]))
             return true
         end
@@ -242,46 +312,149 @@ local function on_upload_done(success, result, err)
         if why == "" then
             why = (result and result.error_string) or tostring(err) or "upload failed"
         end
+        if http_code == 403 then
+            why = why .. " — check copyparty_user (set it iff the server uses --usernames, else leave it empty)"
+        elseif not http_code or http_code == 0 then
+            local proxy = normalized_proxy()
+            if proxy and proxy ~= "" then
+                why = (why ~= "" and why .. " " or "") .. "(connection failed via proxy — is it running?)"
+            end
+        end
         finish_upload(false, "HTTP " .. tostring(http_code) .. " " .. why)
     end
 end
 
-local function start_upload(path)
-    local secret, err = secret_or_error()
-    if not secret then
-        mp.osd_message("Copyparty: " .. tostring(err), 5)
-        return
+-- percent-encode everything but unreserved chars and slashes, for HEAD
+-- existence checks (multipart -F sends the raw name and needs no encoding)
+local function escape_url_path(s)
+    return (s:gsub("[^A-Za-z0-9%-%._~%/]", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end))
+end
+
+-- "yes" exists / "no" free / "unknown" (network/auth trouble: let the
+-- upload itself be the judge, its error message names the real problem)
+local function remote_exists(url, cfg, proxy)
+    local args = {
+        options.curl_path, "--config", cfg, "-I",
+        "--url", url, "-s", "-w", "%{http_code}",
+        "--max-time", "15",
+    }
+    if proxy and proxy ~= "" then
+        args[#args + 1] = "--proxy"
+        args[#args + 1] = proxy
     end
-    local cfg = write_temp_config(secret)
-    secret = nil -- don't keep it around longer than needed
-    if not cfg then
-        mp.osd_message("Copyparty: could not write temp curl config.", 5)
-        return
+    local res = utils.subprocess({ args = args, cancellable = false })
+    if not res or res.status ~= 0 then return "unknown" end
+    -- the -w code is the last thing on stdout; headers above it are full
+    -- of unrelated numbers, so anchor the match at the end
+    local code = tonumber((res.stdout or ""):match("(%d+)%s*$"))
+    if code and code >= 200 and code < 300 then return "yes" end
+    if code == 404 then return "no" end
+    return "unknown"
+end
+
+local pending_choice = nil
+local upload_decide_timer = nil
+
+local function clear_choice_binds()
+    mp.remove_key_binding("copyparty-overwrite")
+    mp.remove_key_binding("copyparty-rename")
+    mp.remove_key_binding("copyparty-nodecision")
+end
+
+local function kill_decide_timer()
+    if upload_decide_timer then upload_decide_timer:kill() upload_decide_timer = nil end
+end
+
+local function cancel_pending(text)
+    pending_choice = nil
+    clear_choice_binds()
+    kill_decide_timer()
+    delete_temp_config()
+    mp.osd_message(text or "Copyparty: cancelled, nothing uploaded.", 3)
+    msg.info("copyparty: upload cancelled before start")
+end
+
+-- forward declaration: ask_overwrite's keybinds call do_upload, defined below
+local do_upload
+
+local function free_remote_name(base, sep, fname, proxy)
+    local stem, ext = fname:match("^(.*)(%.[^%.]+)$")
+    if not stem then stem, ext = fname, "" end
+    for i = 2, 100 do
+        local cand = stem .. "-" .. i .. ext
+        if remote_exists(base .. escape_url_path(cand), temp_config, proxy) ~= "yes" then
+            return cand
+        end
     end
-    local base = options.copyparty_url
-    if base:sub(-1) ~= "/" then base = base .. "/" end
-    local sep = base:find("?", 1, true) and "&" or "?"
+    return nil
+end
+
+local function ask_overwrite(path, base, sep, remote, proxy)
+    pending_choice = { path = path, base = base, sep = sep, remote = remote, proxy = proxy }
+    mp.osd_message("Exists on server:\n" .. remote .. "\n[y] overwrite anyway / [r] auto-rename / [ESC] cancel (default)", 60)
+    mp.add_key_binding("y", "copyparty-overwrite", function()
+        local p = pending_choice
+        pending_choice = nil
+        clear_choice_binds()
+        kill_decide_timer()
+        if p then
+            msg.info("copyparty: overwriting " .. p.remote)
+            do_upload(p.path, p.base, p.sep, p.remote, p.proxy)
+        end
+    end)
+    mp.add_key_binding("r", "copyparty-rename", function()
+        local p = pending_choice
+        pending_choice = nil
+        clear_choice_binds()
+        kill_decide_timer()
+        if not p then return end
+        local alt = free_remote_name(p.base, p.sep, p.remote, p.proxy)
+        if not alt then
+            delete_temp_config()
+            mp.osd_message("Copyparty: no free name found, cancelled.", 4)
+            return
+        end
+        msg.info("copyparty: uploading as " .. alt)
+        do_upload(p.path, p.base, p.sep, alt, p.proxy)
+    end)
+    mp.add_key_binding("ESC", "copyparty-nodecision", function()
+        cancel_pending("Copyparty: cancelled, nothing uploaded.")
+    end)
+    upload_decide_timer = mp.add_timeout(60, function()
+        if pending_choice then
+            cancel_pending("Copyparty: no choice made, nothing uploaded.")
+        end
+    end)
+end
+
+do_upload = function(path, base, sep, target, proxy)
     local response = os.tmpname()
     local progress = os.tmpname()
     local f0 = io.open(progress, "w")
     if f0 then f0:close() end
     local args = {
         options.curl_path,
-        "--config", cfg,
-        "-F", "f=@" .. tostring(escape_form_path(path)),
+        "--config", temp_config,
+        "-F", "f=@" .. tostring(escape_form_path(path)) .. ";filename=" .. target,
         "--url", base .. sep .. "want=url",
         "-o", response,
         "-w", "%{http_code}",
         "-#",
         "--stderr", progress,
     }
+    if proxy and proxy ~= "" then
+        args[#args + 1] = "--proxy"
+        args[#args + 1] = proxy
+    end
     uploading = true
-    upload_tmp = cfg
+    upload_tmp = temp_config
     upload_response = response
     upload_progress = progress
     upload_percent = -1
-    local _, fname = utils.split_path(path)
-    mp.osd_message("Uploading to copyparty:\n" .. tostring(fname) .. "\nESC cancels", 60)
+    temp_config = nil -- ownership moved to the upload; finish/cancel deletes via upload_tmp
+    mp.osd_message("Uploading to copyparty as:\n" .. tostring(target) .. "\nESC cancels", 60)
     mp.add_key_binding("ESC", "copyparty-cancel", cancel_upload)
     upload_timer = mp.add_periodic_timer(0.3, poll_upload_progress)
     upload_handle = mp.command_native_async({
@@ -295,6 +468,37 @@ local function start_upload(path)
     if not upload_handle then
         finish_upload(false, "could not start curl")
     end
+end
+
+local function start_upload(path)
+    local method, secret = secret_or_error()
+    if not method then
+        mp.osd_message("Copyparty: " .. tostring(secret), 5)
+        msg.warn("copyparty: " .. tostring(secret))
+        return
+    end
+    local proxy, perr = check_transport(options.copyparty_url)
+    if not proxy then
+        mp.osd_message("Copyparty: " .. tostring(perr), 6)
+        msg.warn("copyparty: " .. tostring(perr))
+        return
+    end
+    local cfg = write_temp_config(method, secret)
+    secret = nil -- don't keep it around longer than needed
+    if not cfg then
+        mp.osd_message("Copyparty: could not write temp curl config.", 5)
+        return
+    end
+    local base = options.copyparty_url
+    if base:sub(-1) ~= "/" then base = base .. "/" end
+    local sep = base:find("?", 1, true) and "&" or "?"
+    local _, fname = utils.split_path(path)
+    local state = remote_exists(base .. escape_url_path(fname), cfg, proxy)
+    if state == "yes" then
+        ask_overwrite(path, base, sep, fname, proxy)
+        return
+    end
+    do_upload(path, base, sep, fname, proxy)
 end
 
 local function trigger()
@@ -313,12 +517,6 @@ local function trigger()
         mp.osd_message("Copyparty: only local files supported.", 3)
         return
     end
-    local secret, err = secret_or_error()
-    if not secret then
-        mp.osd_message("Copyparty: " .. tostring(err), 5)
-        return
-    end
-    secret = nil
     msg.info("copyparty: uploading current file " .. src)
     start_upload(src)
 end
