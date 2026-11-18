@@ -360,6 +360,7 @@ local upload_decide_timer = nil
 local function clear_choice_binds()
     mp.remove_key_binding("copyparty-overwrite")
     mp.remove_key_binding("copyparty-rename")
+    mp.remove_key_binding("copyparty-copylink")
     mp.remove_key_binding("copyparty-nodecision")
 end
 
@@ -393,7 +394,7 @@ end
 
 local function ask_overwrite(path, base, sep, remote, proxy)
     pending_choice = { path = path, base = base, sep = sep, remote = remote, proxy = proxy }
-    mp.osd_message("Exists on server:\n" .. remote .. "\n[y] overwrite anyway / [r] auto-rename / [ESC] cancel (default)", 60)
+    mp.osd_message("Exists on server:\n" .. remote .. "\n[y] overwrite / [r] auto-rename / [c] copy link / [ESC] cancel (default)", 60)
     mp.add_key_binding("y", "copyparty-overwrite", function()
         local p = pending_choice
         pending_choice = nil
@@ -418,6 +419,19 @@ local function ask_overwrite(path, base, sep, remote, proxy)
         end
         msg.info("copyparty: uploading as " .. alt)
         do_upload(p.path, p.base, p.sep, alt, p.proxy)
+    end)
+    mp.add_key_binding("c", "copyparty-copylink", function()
+        local p = pending_choice
+        pending_choice = nil
+        clear_choice_binds()
+        kill_decide_timer()
+        if not p then return end
+        delete_temp_config()
+        local link = p.base .. escape_url_path(p.remote)
+        local copied = copy_link(link)
+        local note = copied and "(link copied to clipboard)" or "(copy it manually!)"
+        mp.osd_message("Copyparty: nothing uploaded, existing link:\n" .. link .. "\n" .. note, 8)
+        msg.info("copyparty: existing link " .. link)
     end)
     mp.add_key_binding("ESC", "copyparty-nodecision", function()
         cancel_pending("Copyparty: cancelled, nothing uploaded.")
