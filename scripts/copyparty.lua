@@ -2,6 +2,10 @@
 --
 -- Flow: press P while anything is playing and the file is uploaded as-is
 -- with multipart POST + ?want=url. No encoding, no webm.lua involved.
+-- Emoji/accented/fullwidth/Cyrillic filenames are rewritten to plain ASCII
+-- with a deterministic mapping first, so the server never sees a name it
+-- might redirect on and the same local name always lands on the same
+-- remote name (see normalize_filenames).
 -- The password comes from a gitignored .env file and only ever reaches
 -- curl through a 0600 temp config file: never on a command line,
 -- never in mpv logs, never in git.
@@ -31,6 +35,11 @@ local options = {
     curl_path = "curl",
     copy_to_clipboard = true,
     open_after_upload = false,
+    -- Rewrite weird characters (emoji, accents, fullwidth, cyrillic, ...) to
+    -- plain ASCII before uploading. Deterministic: the same local name always
+    -- becomes the same remote name, so the overwrite prompt keeps working.
+    -- Turn off to keep the raw name (works only if your server/proxy copes).
+    normalize_filenames = true,
 }
 mpopts.read_options(options, "copyparty")
 
@@ -178,6 +187,247 @@ local function escape_form_path(path)
     return path:gsub("([,;])", "\\%1")
 end
 
+-- deterministic filename normalisation ---------------------------------------
+-- Source names often carry emoji, accents or fullwidth characters; copyparty
+-- (or a reverse proxy in front of it) sometimes answers those with a redirect
+-- instead of the uploaded file. Everything below is a pure function of the
+-- original name, so uploading the same name twice always produces the same
+-- remote name and the overwrite prompt keeps working instead of piling up
+-- "-2" copies.
+
+-- walk a UTF-8 string as codepoints; -1 means "invalid byte". Callers treat
+-- that as lossy rather than guessing, so broken names stay deterministic too.
+local function codepoints(s)
+    local i, n = 1, #s
+    return function()
+        if i > n then return nil end
+        local b = s:byte(i)
+        local cp, extra
+        if b < 0x80 then
+            cp, extra = b, 0
+        elseif b >= 0xC2 and b <= 0xDF then
+            cp, extra = b - 0xC0, 1
+        elseif b >= 0xE0 and b <= 0xEF then
+            cp, extra = b - 0xE0, 2
+        elseif b >= 0xF0 and b <= 0xF4 then
+            cp, extra = b - 0xF0, 3
+        else
+            i = i + 1
+            return -1
+        end
+        if i + extra > n then
+            i = n + 1
+            return -1
+        end
+        for k = 1, extra do
+            local c = s:byte(i + k)
+            if c < 0x80 or c > 0xBF then
+                i = i + 1
+                return -1
+            end
+            cp = cp * 64 + (c - 0x80)
+        end
+        i = i + extra + 1
+        return cp
+    end
+end
+
+-- codepoint -> ascii for the scripts that show up in real filenames. Only
+-- characters we can actually spell out are listed; anything else is dropped
+-- and flagged lossy. Decomposed accents (U+0300..U+036F) are dropped, so NFC
+-- and NFD spellings of the same name normalise identically.
+-- Entries are { lowercase ascii, lowercase letters, uppercase letters };
+-- the uppercase ascii form is derived, so "ÉTÉ" stays "ETE" instead of
+-- silently colliding with "été".
+local translit = {}
+do
+    local groups = {
+        -- latin-1 / latin extended
+        { "a", "àáâãäåāăą", "ÀÁÂÃÄÅĀĂĄ" },
+        { "ae", "æ", "Æ" },
+        { "c", "çćĉċč", "ÇĆĈĊČ" },
+        { "d", "ďđð", "ĎĐÐ" },
+        { "e", "èéêëēĕėęě", "ÈÉÊËĒĔĖĘĚ" },
+        { "g", "ĝğġģ", "ĜĞĠĢ" },
+        { "h", "ĥħ", "ĤĦ" },
+        { "i", "ìíîïĩīĭįı", "ÌÍÎÏĨĪĬĮİ" },
+        { "j", "ĵ", "Ĵ" },
+        { "k", "ķ", "Ķ" },
+        { "l", "ĺļľŀł", "ĹĻĽĿŁ" },
+        { "n", "ñńņň", "ÑŃŅŇ" },
+        { "o", "òóôõöøōŏő", "ÒÓÔÕÖØŌŎŐ" },
+        { "oe", "œ", "Œ" },
+        { "r", "ŕŗř", "ŔŖŘ" },
+        { "s", "śŝşš", "ŚŜŞŠ" },
+        { "ss", "ß", "ẞ" },
+        { "t", "ţťŧ", "ŢŤŦ" },
+        { "th", "þ", "Þ" },
+        { "u", "ùúûüũūŭůűų", "ÙÚÛÜŨŪŬŮŰŲ" },
+        { "w", "ŵ", "Ŵ" },
+        { "y", "ýŷÿ", "ÝŶŸ" },
+        { "z", "źżž", "ŹŻŽ" },
+        -- cyrillic
+        { "a", "а", "А" },
+        { "b", "б", "Б" },
+        { "v", "в", "В" },
+        { "g", "гґ", "ГҐ" },
+        { "d", "д", "Д" },
+        { "e", "еэ", "ЕЭ" },
+        { "yo", "ё", "Ё" },
+        { "zh", "ж", "Ж" },
+        { "z", "з", "З" },
+        { "i", "иії", "ИІЇ" },
+        { "y", "йы", "ЙЫ" },
+        { "k", "к", "К" },
+        { "l", "л", "Л" },
+        { "m", "м", "М" },
+        { "n", "н", "Н" },
+        { "o", "о", "О" },
+        { "p", "п", "П" },
+        { "r", "р", "Р" },
+        { "s", "с", "С" },
+        { "t", "т", "Т" },
+        { "u", "у", "У" },
+        { "f", "ф", "Ф" },
+        { "kh", "х", "Х" },
+        { "ts", "ц", "Ц" },
+        { "ch", "ч", "Ч" },
+        { "sh", "ш", "Ш" },
+        { "shch", "щ", "Щ" },
+        { "", "ъь", "ЪЬ" },
+        { "yu", "ю", "Ю" },
+        { "ya", "я", "Я" },
+        { "ye", "є", "Є" },
+        { "dj", "ђ", "Ђ" },
+        { "j", "ј", "Ј" },
+        { "lj", "љ", "Љ" },
+        { "nj", "њ", "Њ" },
+        { "c", "ћ", "Ћ" },
+        { "dz", "џ", "Џ" },
+    }
+    for _, group in ipairs(groups) do
+        for _, pair in ipairs({ { group[1], group[2] }, { group[1]:upper(), group[3] } }) do
+            local iter = codepoints(pair[2])
+            while true do
+                local cp = iter()
+                if not cp then break end
+                if cp ~= -1 and translit[cp] == nil then translit[cp] = pair[1] end
+            end
+        end
+    end
+end
+
+-- stable 6-char base36 suffix, so two different names that collapse to the
+-- same ascii text (e.g. "東京.mp4" and "🔥.mp4") stay distinct.
+-- Plain arithmetic only: the script has to run on Lua 5.1, 5.2 and LuaJIT.
+local base36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+local function short_hash(s)
+    local h = 5381
+    for i = 1, #s do
+        h = (h * 33 + s:byte(i)) % 2147483647
+    end
+    local out = {}
+    for _ = 1, 6 do
+        local d = h % 36
+        out[#out + 1] = base36:sub(d + 1, d + 1)
+        h = math.floor(h / 36)
+    end
+    return table.concat(out)
+end
+
+-- ASCII version of one component. Second return is true only when something
+-- we cannot spell out had to be dropped (emoji, unknown script, invalid
+-- bytes); plain punctuation is folded to "-" without flagging, so ordinary
+-- western names stay readable.
+local function ascii_component(text, keep_dot)
+    local out = {}
+    local lossy = false
+    local iter = codepoints(text)
+    while true do
+        local cp = iter()
+        if not cp then break end
+        local piece
+        if cp == -1 then
+            lossy = true
+        elseif (cp >= 0x30 and cp <= 0x39) or (cp >= 0x41 and cp <= 0x5A)
+            or (cp >= 0x61 and cp <= 0x7A) then
+            piece = string.char(cp)
+        elseif cp == 0x2D or cp == 0x5F or (keep_dot and cp == 0x2E) then
+            piece = string.char(cp)
+        elseif cp == 0x27 or cp == 0x60 or cp == 0xB4
+            or cp == 0x2018 or cp == 0x2019 then
+            piece = "" -- apostrophes just vanish: "what's" -> "whats"
+        elseif cp < 0x80 then
+            piece = "-" -- space and every other ascii punctuation
+        elseif cp >= 0x300 and cp <= 0x36F then
+            piece = "" -- combining accent, base letter is already there
+        elseif translit[cp] then
+            piece = translit[cp]
+        elseif cp == 0xA0 or cp == 0x3000 then
+            piece = "-"
+        elseif cp >= 0xFF01 and cp <= 0xFF5E then
+            -- fullwidth forms map straight onto ascii
+            local a = cp - 0xFEE0
+            if (a >= 0x30 and a <= 0x39) or (a >= 0x41 and a <= 0x5A)
+                or (a >= 0x61 and a <= 0x7A) then
+                piece = string.char(a)
+            else
+                piece = "-"
+            end
+        else
+            lossy = true
+        end
+        if piece then out[#out + 1] = piece end
+    end
+    local s = table.concat(out)
+    s = s:gsub("%-+", "-")
+    s = s:gsub("^[%-%._]+", ""):gsub("[%-%._]+$", "")
+    return s, lossy
+end
+
+-- 120 bytes + ".ext" is well under every filesystem and header limit in play
+local FILENAME_STEM_MAX = 120
+local HASH_SUFFIX_LEN = 7 -- "-" + 6 base36 chars
+
+local function clean_extension(ext)
+    ext = ext:lower():gsub("[^a-z0-9]", "")
+    if #ext > 10 then ext = ext:sub(1, 10) end
+    return ext
+end
+
+local function trim_stem(s)
+    return (s:gsub("^[%-%._]+", ""):gsub("[%-%._]+$", ""))
+end
+
+-- idempotent: normalize_filename(normalize_filename(x)) == normalize_filename(x)
+local function normalize_filename(fname)
+    local stem, ext = fname, ""
+    local dot = fname:match("^.*()%.")
+    if dot and dot > 1 and dot < #fname then
+        stem = fname:sub(1, dot - 1)
+        ext = fname:sub(dot + 1)
+    end
+    local clean_stem, lossy = ascii_component(stem, true)
+    local clean_ext = clean_extension(ext)
+    local truncated = false
+    if #clean_stem > FILENAME_STEM_MAX then
+        clean_stem = trim_stem(clean_stem:sub(1, FILENAME_STEM_MAX))
+        truncated = true
+    end
+    if lossy or truncated or clean_stem == "" then
+        -- leave room for the suffix so a second pass never re-truncates and
+        -- therefore never hashes something different
+        local room = FILENAME_STEM_MAX - HASH_SUFFIX_LEN
+        if #clean_stem > room then clean_stem = trim_stem(clean_stem:sub(1, room)) end
+        local suffix = short_hash(fname)
+        clean_stem = (clean_stem ~= "" and clean_stem .. "-" or "file-") .. suffix
+    end
+    if clean_ext ~= "" then
+        return clean_stem .. "." .. clean_ext
+    end
+    return clean_stem
+end
+
 local function copy_link(url)
     if not options.copy_to_clipboard then return false end
     local ok, written = pcall(function()
@@ -314,6 +564,8 @@ local function on_upload_done(success, result, err)
         end
         if http_code == 403 then
             why = why .. " — check copyparty_user (set it iff the server uses --usernames, else leave it empty)"
+        elseif http_code and http_code >= 300 and http_code < 400 then
+            why = why .. " (redirected: copyparty_url should point at the volume, not a login page)"
         elseif not http_code or http_code == 0 then
             local proxy = normalized_proxy()
             if proxy and proxy ~= "" then
@@ -507,12 +759,20 @@ local function start_upload(path)
     if base:sub(-1) ~= "/" then base = base .. "/" end
     local sep = base:find("?", 1, true) and "&" or "?"
     local _, fname = utils.split_path(path)
-    local state = remote_exists(base .. escape_url_path(fname), cfg, proxy)
+    -- ASCII-only remote name: emoji/accented/fullwidth characters make
+    -- copyparty or its proxy answer with a redirect on some setups. The
+    -- mapping is deterministic, so the same local name always lands on the
+    -- same remote name and the overwrite prompt stays meaningful.
+    local remote_name = options.normalize_filenames and normalize_filename(fname) or fname
+    if remote_name ~= fname then
+        msg.info("copyparty: sanitized filename " .. fname .. " -> " .. remote_name)
+    end
+    local state = remote_exists(base .. escape_url_path(remote_name), cfg, proxy)
     if state == "yes" then
-        ask_overwrite(path, base, sep, fname, proxy)
+        ask_overwrite(path, base, sep, remote_name, proxy)
         return
     end
-    do_upload(path, base, sep, fname, proxy)
+    do_upload(path, base, sep, remote_name, proxy)
 end
 
 local function trigger()
